@@ -1,0 +1,859 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>CELEX · Asistencia y Calificaciones</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<style>
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #faf8fc; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo } = React;
+
+// =====================================================================
+// ¡IMPORTANTE! Pega aquí la URL de tu Apps Script Web App (Paso 3 de la guía)
+// =====================================================================
+const API_URL = 'https://script.google.com/macros/s/AKfycbxKsezWLqUfC528CZox1CXSqYsWlKIrw_oHF3Ruuj3wSZMvXZKb62exAxgFXfAYkUrA/exec';
+
+async function apiGet(params) {
+  const qs = new URLSearchParams(params).toString();
+  const resp = await fetch(`${API_URL}?${qs}`);
+  return resp.json();
+}
+async function apiPost(payload) {
+  const resp = await fetch(API_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body: JSON.stringify(payload),
+  });
+  return resp.json();
+}
+
+const C = {
+  violeta: '#5E1E78', violeta2: '#5b4d8a', dorado: '#D9A62B', dorado2: '#c9a84c',
+  teal: '#2C8C86', teal2: '#2d7a7a', bg: '#faf8fc', card: '#ffffff', text: '#2b2130',
+  textMuted: '#736b7c', border: '#e6dfee', danger: '#c0392b', dangerBg: '#fbeceb', okBg: '#e9f5f3',
+};
+
+const ESTADOS = ['P', 'F', 'R'];
+const ESTADO_COLOR = { P: C.teal, F: C.danger, R: C.dorado };
+
+function todayStr() { return new Date().toISOString().slice(0, 10); }
+function diasEntre(a, b) { return Math.floor((b - a) / (1000 * 60 * 60 * 24)); }
+
+function periodoDeFecha(fechaStr, meta) {
+  if (!meta.startDate) return 0;
+  const start = new Date(meta.startDate + 'T00:00:00');
+  const fecha = new Date(fechaStr + 'T00:00:00');
+  const dias = diasEntre(start, fecha);
+  if (dias < 0) return 0;
+  const idx = Math.floor(dias / (meta.weeksPerPeriodo * 7));
+  return Math.min(Math.max(idx, 0), meta.numPeriodos - 1);
+}
+
+function pctAsistencia(asistenciaGrupo, matricula, periodoIdx, meta) {
+  let total = 0, suma = 0;
+  Object.entries(asistenciaGrupo || {}).forEach(([fecha, registros]) => {
+    if (periodoDeFecha(fecha, meta) === periodoIdx && registros[matricula] !== undefined) {
+      total += 1;
+      const st = registros[matricula];
+      suma += st === 'P' ? 1 : st === 'R' ? 0.5 : 0;
+    }
+  });
+  if (total === 0) return null;
+  return (suma / total) * 100;
+}
+
+function calcularCalificacion(reg) {
+  if (!reg) return null;
+  const oral = reg.oral, uoe = reg.usoEnglish;
+  if (oral === undefined || oral === '' || uoe === undefined || uoe === '') return null;
+  const oralNum = Number(oral), uoeNum = Number(uoe);
+  if (Number.isNaN(oralNum) || Number.isNaN(uoeNum)) return null;
+  return oralNum * 0.6 + uoeNum * 0.4;
+}
+
+function cumpleRequisitos(asisPct, reg) {
+  if (asisPct === null || !reg) return false;
+  const plataforma = reg.plataforma;
+  if (plataforma === undefined || plataforma === '') return false;
+  return asisPct >= 85 && Number(plataforma) >= 70;
+}
+
+function descargarWorkbook(hojas, nombreArchivo) {
+  const wb = XLSX.utils.book_new();
+  hojas.forEach(({ nombre, filas }) => {
+    const ws = XLSX.utils.json_to_sheet(filas);
+    XLSX.utils.book_append_sheet(wb, ws, nombre.slice(0, 31));
+  });
+  const wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+  const blob = new Blob([wbout], { type: 'application/octet-stream' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = nombreArchivo;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+function Badge({ ok, children }) {
+  return (
+    <span style={{ display: 'inline-block', padding: '2px 10px', borderRadius: 999, fontSize: 12, fontWeight: 600, color: ok ? C.teal2 : C.danger, background: ok ? C.okBg : C.dangerBg }}>
+      {children}
+    </span>
+  );
+}
+
+function StatCard({ label, value, accent }) {
+  return (
+    <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 14, padding: '18px 20px', flex: '1 1 160px', minWidth: 150 }}>
+      <div style={{ fontSize: 12, color: C.textMuted, fontWeight: 600, letterSpacing: 0.3, textTransform: 'uppercase' }}>{label}</div>
+      <div style={{ fontSize: 28, fontWeight: 800, color: accent || C.violeta, marginTop: 6 }}>{value}</div>
+    </div>
+  );
+}
+
+function Btn({ children, onClick, variant = 'primary', small, disabled, style }) {
+  const base = { border: 'none', borderRadius: 10, padding: small ? '6px 12px' : '10px 18px', fontSize: small ? 13 : 14, fontWeight: 700, cursor: disabled ? 'not-allowed' : 'pointer', opacity: disabled ? 0.5 : 1 };
+  const variants = {
+    primary: { background: C.violeta, color: '#fff' },
+    gold: { background: C.dorado, color: '#3a2a05' },
+    teal: { background: C.teal, color: '#fff' },
+    ghost: { background: 'transparent', color: C.violeta, border: `1px solid ${C.border}` },
+    danger: { background: C.dangerBg, color: C.danger },
+  };
+  return <button onClick={disabled ? undefined : onClick} style={{ ...base, ...variants[variant], ...style }}>{children}</button>;
+}
+
+function Tabs({ tabs, active, onChange }) {
+  return (
+    <div style={{ display: 'flex', gap: 6, borderBottom: `1px solid ${C.border}`, marginBottom: 18, flexWrap: 'wrap' }}>
+      {tabs.map((t) => (
+        <button key={t.key} onClick={() => onChange(t.key)} style={{ border: 'none', background: 'transparent', padding: '10px 16px', fontSize: 14, fontWeight: 700, cursor: 'pointer', color: active === t.key ? C.violeta : C.textMuted, borderBottom: active === t.key ? `3px solid ${C.dorado}` : '3px solid transparent', marginBottom: -1 }}>
+          {t.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+const inputStyle = { width: '100%', padding: '10px 12px', borderRadius: 10, border: `1px solid ${C.border}`, fontSize: 14, boxSizing: 'border-box', fontFamily: 'inherit' };
+const labelStyle = { display: 'block', fontSize: 13, fontWeight: 700, color: C.textMuted, margin: '14px 0 6px' };
+const tableStyle = { width: '100%', borderCollapse: 'collapse', background: C.card, borderRadius: 12, overflow: 'hidden', fontSize: 13 };
+const thStyle = { textAlign: 'left', padding: '10px 12px', background: C.violeta, color: '#fff', fontWeight: 700, fontSize: 12, textTransform: 'uppercase', letterSpacing: 0.3 };
+const tdStyle = { padding: '9px 12px', borderBottom: `1px solid ${C.border}` };
+function cardBtnStyle(active) {
+  return { flex: 1, padding: '20px 16px', borderRadius: 16, border: active ? `2px solid ${C.violeta}` : `1px solid ${C.border}`, background: active ? C.okBg : C.card, cursor: 'pointer' };
+}
+
+function App() {
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
+  const [roster, setRoster] = useState([]);
+  const [meta, setMeta] = useState({ numPeriodos: 3, weeksPerPeriodo: 5, startDate: '' });
+  const [role, setRole] = useState(null);
+  const [docenteActivo, setDocenteActivo] = useState('');
+  const [coordScreen, setCoordScreen] = useState('resumen');
+  const [grupoSeleccionado, setGrupoSeleccionado] = useState(null);
+  const [detalleDesde, setDetalleDesde] = useState(null);
+  const [coordToken, setCoordToken] = useState('');
+  const [refreshing, setRefreshing] = useState(false);
+
+  useEffect(() => { cargarTodo(); }, []);
+
+  async function cargarTodo() {
+    setLoading(true);
+    setLoadError('');
+    try {
+      const data = await apiGet({ action: 'bootstrap' });
+      if (data.error) throw new Error(data.error);
+      setRoster(data.roster || []);
+      setMeta(data.config || {});
+    } catch (e) {
+      setLoadError('No se pudo conectar con el backend. Revisa que API_URL esté bien puesta y que el Apps Script esté desplegado con acceso. Detalle: ' + e.message);
+    }
+    setLoading(false);
+  }
+
+  async function actualizarDatos() {
+    setRefreshing(true);
+    await cargarTodo();
+    setRefreshing(false);
+  }
+
+  async function guardarMeta(nuevo) {
+    const resp = await apiPost({ action: 'guardarConfig', token: coordToken, config: nuevo });
+    if (resp.error) { alert(resp.error); return; }
+    setMeta(resp.config);
+  }
+
+  const docentes = useMemo(() => {
+    const set = new Set();
+    roster.forEach((s) => { if (s.docente) set.add(s.docente); });
+    return Array.from(set).sort();
+  }, [roster]);
+
+  const grupos = useMemo(() => {
+    const map = {};
+    roster.forEach((s) => {
+      if (!map[s.grupo]) {
+        map[s.grupo] = { grupo: s.grupo, nivel: s.nivel, horario: s.horario, docente: s.docente, correoDocente: s.correoDocente, aula: s.aula, estudiantes: [] };
+      }
+      map[s.grupo].estudiantes.push(s);
+    });
+    return Object.values(map).sort((a, b) => a.grupo.localeCompare(b.grupo));
+  }, [roster]);
+
+  const gruposPorDocente = useMemo(() => {
+    const map = {};
+    grupos.forEach((g) => { if (!g.docente) return; if (!map[g.docente]) map[g.docente] = []; map[g.docente].push(g); });
+    return map;
+  }, [grupos]);
+
+  const periodoActualIdx = periodoDeFecha(todayStr(), meta);
+
+  function cerrarSesion() {
+    setRole(null); setDocenteActivo(''); setCoordToken(''); setCoordScreen('resumen'); setGrupoSeleccionado(null); setDetalleDesde(null);
+  }
+
+  if (loading) {
+    return <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: 300, color: C.textMuted }}>Cargando datos de CELEX…</div>;
+  }
+  if (loadError) {
+    return <div style={{ maxWidth: 560, margin: '60px auto', padding: 20, background: C.dangerBg, color: C.danger, borderRadius: 12 }}>{loadError}</div>;
+  }
+
+  return (
+    <div style={{ minHeight: '100%', color: C.text }}>
+      <div style={{ background: `linear-gradient(135deg, ${C.violeta} 0%, ${C.violeta2} 100%)`, color: '#fff', padding: '18px 24px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 10 }}>
+        <div>
+          <div style={{ fontSize: 12, letterSpacing: 1.5, textTransform: 'uppercase', opacity: 0.8, fontWeight: 700 }}>CELEX · UVP</div>
+          <div style={{ fontSize: 20, fontWeight: 800 }}>Asistencia y Calificaciones · A26-E27</div>
+        </div>
+        {role && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <span style={{ fontSize: 13, opacity: 0.9 }}>{role === 'coord' ? 'Coordinación' : `Docente: ${docenteActivo}`}</span>
+            <Btn variant="gold" small onClick={cerrarSesion}>Cerrar sesión</Btn>
+          </div>
+        )}
+      </div>
+
+      <div style={{ padding: 24, maxWidth: 1200, margin: '0 auto' }}>
+        {!role && (
+          <LoginScreen docentes={docentes} onCoord={(token) => { setCoordToken(token); setRole('coord'); }} onDocente={(nombre) => { setRole('docente'); setDocenteActivo(nombre); }} />
+        )}
+
+        {role === 'coord' && !grupoSeleccionado && (
+          <CoordDashboard roster={roster} grupos={grupos} docentes={docentes} meta={meta} guardarMeta={guardarMeta}
+            screen={coordScreen} setScreen={setCoordScreen} periodoActualIdx={periodoActualIdx}
+            onVerGrupo={(g) => { setGrupoSeleccionado(g); setDetalleDesde('coord'); }}
+            actualizarDatos={actualizarDatos} refreshing={refreshing} coordToken={coordToken} />
+        )}
+
+        {role === 'docente' && !grupoSeleccionado && (
+          <DocenteHome docenteActivo={docenteActivo} gruposDocente={gruposPorDocente[docenteActivo] || []}
+            onEntrarGrupo={(g) => { setGrupoSeleccionado(g); setDetalleDesde('docente'); }} />
+        )}
+
+        {grupoSeleccionado && (
+          <GrupoDetalle grupo={grupoSeleccionado} meta={meta} periodoActualIdx={periodoActualIdx}
+            volver={() => setGrupoSeleccionado(null)} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function LoginScreen({ docentes, onCoord, onDocente }) {
+  const [filtro, setFiltro] = useState('');
+  const [modo, setModo] = useState(null);
+  const [pinInput, setPinInput] = useState('');
+  const [pinConfirm, setPinConfirm] = useState('');
+  const [pinError, setPinError] = useState('');
+  const [pinEstado, setPinEstado] = useState(null);
+  const [cargando, setCargando] = useState(false);
+  const filtrados = docentes.filter((d) => d.toLowerCase().includes(filtro.toLowerCase()));
+
+  useEffect(() => {
+    if (modo === 'coord' && pinEstado === null) {
+      apiPost({ action: 'verificarPin', pin: '' }).then((r) => setPinEstado(r.sinConfigurar ? 'sinConfigurar' : 'existe'));
+    }
+  }, [modo]);
+
+  async function intentarEntrarCoord() {
+    setCargando(true);
+    const r = await apiPost({ action: 'verificarPin', pin: pinInput });
+    setCargando(false);
+    if (r.ok) { setPinError(''); onCoord(pinInput); }
+    else setPinError('PIN incorrecto.');
+  }
+
+  async function crearPin() {
+    if (pinInput.length < 4) { setPinError('Usa al menos 4 caracteres.'); return; }
+    if (pinInput !== pinConfirm) { setPinError('Los dos PIN no coinciden.'); return; }
+    setCargando(true);
+    const r = await apiPost({ action: 'crearPin', pin: pinInput });
+    setCargando(false);
+    if (r.error) { setPinError(r.error); return; }
+    onCoord(pinInput);
+  }
+
+  return (
+    <div style={{ maxWidth: 480, margin: '40px auto', textAlign: 'center' }}>
+      <div style={{ fontSize: 15, color: C.textMuted, marginBottom: 24 }}>¿Cómo quieres entrar?</div>
+      <div style={{ display: 'flex', gap: 14, justifyContent: 'center', marginBottom: 28 }}>
+        <button onClick={() => { setModo('coord'); setPinInput(''); setPinConfirm(''); setPinError(''); }} style={cardBtnStyle(modo === 'coord')}>
+          <div style={{ fontSize: 28 }}>🗂️</div>
+          <div style={{ fontWeight: 800, marginTop: 6 }}>Coordinación</div>
+        </button>
+        <button onClick={() => setModo('docente')} style={cardBtnStyle(modo === 'docente')}>
+          <div style={{ fontSize: 28 }}>🧑‍🏫</div>
+          <div style={{ fontWeight: 800, marginTop: 6 }}>Docente</div>
+        </button>
+      </div>
+
+      {modo === 'coord' && pinEstado === null && <div style={{ color: C.textMuted, fontSize: 13 }}>Cargando…</div>}
+
+      {modo === 'coord' && pinEstado === 'sinConfigurar' && (
+        <div style={{ textAlign: 'left' }}>
+          <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 10 }}>
+            Todavía no hay un PIN configurado. Crea uno ahora — se guarda de forma segura en el servidor, no en el navegador.
+          </div>
+          <label style={labelStyle}>Nuevo PIN (mínimo 4 caracteres)</label>
+          <input type="password" value={pinInput} onChange={(e) => setPinInput(e.target.value)} style={inputStyle} />
+          <label style={labelStyle}>Confirma el PIN</label>
+          <input type="password" value={pinConfirm} onChange={(e) => setPinConfirm(e.target.value)} style={inputStyle} />
+          {pinError && <div style={{ color: C.danger, fontSize: 13, marginTop: 8 }}>{pinError}</div>}
+          <div style={{ marginTop: 12 }}><Btn onClick={crearPin} disabled={cargando}>Crear PIN y entrar</Btn></div>
+        </div>
+      )}
+
+      {modo === 'coord' && pinEstado === 'existe' && (
+        <div style={{ textAlign: 'left' }}>
+          <label style={labelStyle}>PIN de Coordinación</label>
+          <input type="password" value={pinInput} onChange={(e) => setPinInput(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') intentarEntrarCoord(); }} style={inputStyle} autoFocus />
+          {pinError && <div style={{ color: C.danger, fontSize: 13, marginTop: 8 }}>{pinError}</div>}
+          <div style={{ marginTop: 12 }}><Btn onClick={intentarEntrarCoord} disabled={cargando}>Entrar como Coordinación</Btn></div>
+        </div>
+      )}
+
+      {modo === 'docente' && (
+        <div style={{ textAlign: 'left' }}>
+          <input placeholder="Busca tu nombre…" value={filtro} onChange={(e) => setFiltro(e.target.value)} style={inputStyle} />
+          <div style={{ maxHeight: 240, overflowY: 'auto', border: `1px solid ${C.border}`, borderRadius: 10, marginTop: 8, background: C.card }}>
+            {filtrados.length === 0 && <div style={{ padding: 14, color: C.textMuted, fontSize: 13 }}>Sin coincidencias.</div>}
+            {filtrados.map((d) => (
+              <div key={d} onClick={() => onDocente(d)} style={{ padding: '10px 14px', cursor: 'pointer', borderBottom: `1px solid ${C.border}`, fontSize: 14 }}>{d}</div>
+            ))}
+          </div>
+          <div style={{ fontSize: 12, color: C.textMuted, marginTop: 10 }}>Nota: este acceso identifica al docente por nombre; no sustituye un inicio de sesión con contraseña institucional.</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DocenteHome({ docenteActivo, gruposDocente, onEntrarGrupo }) {
+  if (gruposDocente.length === 0) {
+    return <div style={{ textAlign: 'center', padding: 40, color: C.textMuted }}>No encontramos grupos asignados a <strong>{docenteActivo}</strong> en la base actual. Pide a Coordinación que revise la asignación en el Google Sheet.</div>;
+  }
+  return (
+    <div>
+      <h2 style={{ margin: '0 0 16px' }}>Tus grupos</h2>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 14 }}>
+        {gruposDocente.map((g) => (
+          <div key={g.grupo} onClick={() => onEntrarGrupo(g)} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 14, padding: 18, cursor: 'pointer' }}>
+            <div style={{ fontSize: 12, color: C.dorado2, fontWeight: 700, textTransform: 'uppercase' }}>Nivel {g.nivel}</div>
+            <div style={{ fontSize: 20, fontWeight: 800, color: C.violeta }}>{g.grupo}</div>
+            <div style={{ fontSize: 13, color: C.textMuted, marginTop: 4 }}>{g.horario}{g.aula ? ` · Aula ${g.aula}` : ''}</div>
+            <div style={{ fontSize: 13, color: C.textMuted }}>{g.estudiantes.length} estudiantes</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function CoordDashboard({ roster, grupos, docentes, meta, guardarMeta, screen, setScreen, periodoActualIdx, onVerGrupo, actualizarDatos, refreshing, coordToken }) {
+  const [filtroNivel, setFiltroNivel] = useState('');
+  const [filtroDocente, setFiltroDocente] = useState('');
+  const [filtroTexto, setFiltroTexto] = useState('');
+  const niveles = useMemo(() => Array.from(new Set(roster.map((s) => s.nivel))).sort(), [roster]);
+
+  const gruposFiltrados = grupos.filter((g) => {
+    if (filtroNivel && g.nivel !== filtroNivel) return false;
+    if (filtroDocente && g.docente !== filtroDocente) return false;
+    if (filtroTexto && !g.grupo.toLowerCase().includes(filtroTexto.toLowerCase()) && !(g.docente || '').toLowerCase().includes(filtroTexto.toLowerCase())) return false;
+    return true;
+  });
+
+  return (
+    <div>
+      <Tabs tabs={[
+        { key: 'resumen', label: 'Resumen' }, { key: 'grupos', label: 'Grupos' }, { key: 'diagnostico', label: 'Diagnóstico' },
+        { key: 'alertas', label: 'Alertas' }, { key: 'reporte', label: 'Reporte general' }, { key: 'config', label: 'Configuración' },
+      ]} active={screen} onChange={setScreen} />
+
+      {screen === 'resumen' && (
+        <div>
+          <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', marginBottom: 24 }}>
+            <StatCard label="Estudiantes" value={roster.length} />
+            <StatCard label="Grupos" value={grupos.length} accent={C.teal} />
+            <StatCard label="Docentes" value={docentes.length} accent={C.dorado2} />
+            <StatCard label="Periodo actual" value={`Parcial ${periodoActualIdx + 1} de ${meta.numPeriodos}`} accent={C.violeta2} />
+          </div>
+          <div style={{ marginBottom: 18 }}>
+            <Btn variant="teal" onClick={actualizarDatos} disabled={refreshing}>{refreshing ? 'Actualizando…' : '🔄 Actualizar datos desde el Sheet'}</Btn>
+            <span style={{ fontSize: 12, color: C.textMuted, marginLeft: 10 }}>Los datos ya son en vivo; usa este botón si acabas de editar el Google Sheet y quieres verlo reflejado ahora mismo.</span>
+          </div>
+          <h3 style={{ marginBottom: 10 }}>Estudiantes por nivel</h3>
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+            {niveles.map((n) => (
+              <div key={n} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 16px' }}><strong>{n}</strong>: {roster.filter((s) => s.nivel === n).length}</div>
+            ))}
+          </div>
+          {!meta.startDate && (
+            <div style={{ marginTop: 24, padding: 16, background: C.dangerBg, borderRadius: 12, color: C.danger, fontSize: 14 }}>
+              Falta configurar la fecha de inicio del semestre en <strong>Configuración</strong> para calcular los periodos de 5 semanas correctamente.
+            </div>
+          )}
+        </div>
+      )}
+
+      {screen === 'grupos' && (
+        <div>
+          <div style={{ display: 'flex', gap: 10, marginBottom: 14, flexWrap: 'wrap' }}>
+            <input placeholder="Buscar grupo o docente…" value={filtroTexto} onChange={(e) => setFiltroTexto(e.target.value)} style={{ ...inputStyle, maxWidth: 220 }} />
+            <select value={filtroNivel} onChange={(e) => setFiltroNivel(e.target.value)} style={{ ...inputStyle, maxWidth: 140 }}>
+              <option value="">Todos los niveles</option>{niveles.map((n) => <option key={n} value={n}>{n}</option>)}
+            </select>
+            <select value={filtroDocente} onChange={(e) => setFiltroDocente(e.target.value)} style={{ ...inputStyle, maxWidth: 220 }}>
+              <option value="">Todos los docentes</option>{docentes.map((d) => <option key={d} value={d}>{d}</option>)}
+            </select>
+          </div>
+          <div style={{ overflowX: 'auto' }}>
+            <table style={tableStyle}>
+              <thead><tr><th style={thStyle}>Grupo</th><th style={thStyle}>Nivel</th><th style={thStyle}>Docente</th><th style={thStyle}>Horario</th><th style={thStyle}>Aula</th><th style={thStyle}>Alumnos</th><th style={thStyle}></th></tr></thead>
+              <tbody>
+                {gruposFiltrados.map((g) => (
+                  <tr key={g.grupo}>
+                    <td style={tdStyle}><strong>{g.grupo}</strong></td>
+                    <td style={tdStyle}>{g.nivel}</td>
+                    <td style={tdStyle}>{g.docente || <span style={{ color: C.danger }}>Sin asignar</span>}</td>
+                    <td style={tdStyle}>{g.horario}</td>
+                    <td style={tdStyle}>{g.aula || '—'}</td>
+                    <td style={tdStyle}>{g.estudiantes.length}</td>
+                    <td style={tdStyle}><Btn small variant="ghost" onClick={() => onVerGrupo(g)}>Ver detalle</Btn></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {screen === 'diagnostico' && <DiagnosticoView roster={roster} niveles={niveles} />}
+      {screen === 'alertas' && <AlertasView grupos={grupos} meta={meta} periodoActualIdx={periodoActualIdx} />}
+      {screen === 'reporte' && <ReporteGeneralView grupos={grupos} meta={meta} />}
+      {screen === 'config' && <ConfigView meta={meta} guardarMeta={guardarMeta} coordToken={coordToken} />}
+    </div>
+  );
+}
+
+function DiagnosticoView({ roster, niveles }) {
+  const [filtroNivel, setFiltroNivel] = useState('');
+  const conDato = roster.filter((s) => s.diagnostico !== null && s.diagnostico !== undefined);
+  const filtrados = filtroNivel ? conDato.filter((s) => s.nivel === filtroNivel) : conDato;
+  const promedioPorNivel = niveles.map((n) => {
+    const vals = conDato.filter((s) => s.nivel === n).map((s) => s.diagnostico);
+    const prom = vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+    return { nivel: n, prom, n: vals.length };
+  });
+
+  function exportarDiagnostico() {
+    const filas = filtrados.map((s) => ({ Matrícula: s.matricula, Nombre: s.nombre, División: s.division, Grupo: s.grupo, Nivel: s.nivel, Docente: s.docente, 'Resultado diagnóstico': s.diagnostico }));
+    descargarWorkbook([{ nombre: 'Diagnostico', filas }], 'Reporte_Diagnostico_CELEX.xlsx');
+  }
+
+  return (
+    <div>
+      <h3>Resultado del examen diagnóstico</h3>
+      <p style={{ color: C.textMuted, fontSize: 13 }}>Puntaje bruto del diagnóstico de inducción. Informativo, no participa en el cálculo de la calificación parcial.</p>
+      <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 16 }}>
+        {promedioPorNivel.map((p) => (
+          <div key={p.nivel} style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 16px' }}><strong>{p.nivel}</strong>: promedio {p.prom === null ? '—' : p.prom.toFixed(1)} ({p.n} alumnos)</div>
+        ))}
+      </div>
+      <div style={{ display: 'flex', gap: 10, marginBottom: 14, alignItems: 'center' }}>
+        <select value={filtroNivel} onChange={(e) => setFiltroNivel(e.target.value)} style={{ ...inputStyle, maxWidth: 160 }}>
+          <option value="">Todos los niveles</option>{niveles.map((n) => <option key={n} value={n}>{n}</option>)}
+        </select>
+        <Btn variant="teal" small onClick={exportarDiagnostico}>⬇ Exportar diagnóstico (.xlsx)</Btn>
+      </div>
+      <div style={{ overflowX: 'auto', maxHeight: 420, overflowY: 'auto' }}>
+        <table style={tableStyle}>
+          <thead><tr><th style={thStyle}>Matrícula</th><th style={thStyle}>Nombre</th><th style={thStyle}>Grupo</th><th style={thStyle}>Nivel</th><th style={thStyle}>Docente</th><th style={thStyle}>Resultado</th></tr></thead>
+          <tbody>{filtrados.map((s) => (
+            <tr key={s.matricula}><td style={tdStyle}>{s.matricula}</td><td style={tdStyle}>{s.nombre}</td><td style={tdStyle}>{s.grupo}</td><td style={tdStyle}>{s.nivel}</td><td style={tdStyle}>{s.docente}</td><td style={tdStyle}><strong>{s.diagnostico}</strong></td></tr>
+          ))}</tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function AlertasView({ grupos, meta, periodoActualIdx }) {
+  const [alertas, setAlertas] = useState(null);
+
+  useEffect(() => {
+    let cancel = false;
+    (async () => {
+      const rows = [];
+      for (const g of grupos) {
+        const asisResp = await apiGet({ action: 'asistencia', grupo: g.grupo });
+        const asistenciaGrupo = asisResp.asistencia || {};
+        const califResp = await apiGet({ action: 'calificaciones', grupo: g.grupo });
+        const califGrupo = califResp.calificaciones || {};
+        g.estudiantes.forEach((s) => {
+          const pct = pctAsistencia(asistenciaGrupo, s.matricula, periodoActualIdx, meta);
+          const reg = (califGrupo[s.matricula] && califGrupo[s.matricula][periodoActualIdx]) || null;
+          const plataforma = reg && reg.plataforma !== undefined && reg.plataforma !== '' ? Number(reg.plataforma) : null;
+          const bajaAsistencia = pct !== null && pct < 85;
+          const bajaPlataforma = plataforma !== null && plataforma < 70;
+          if (bajaAsistencia || bajaPlataforma) rows.push({ ...s, pct, plataforma, bajaAsistencia, bajaPlataforma });
+        });
+      }
+      if (!cancel) setAlertas(rows);
+    })();
+    return () => { cancel = true; };
+  }, [grupos, meta, periodoActualIdx]);
+
+  if (alertas === null) return <div style={{ color: C.textMuted }}>Calculando alertas… (puede tardar porque revisa cada grupo)</div>;
+
+  return (
+    <div>
+      <h3>Estudiantes en riesgo — Parcial {periodoActualIdx + 1}</h3>
+      <p style={{ color: C.textMuted, fontSize: 13 }}>Asistencia menor a 85% o % de plataforma menor a 70% en el parcial actual.</p>
+      {alertas.length === 0 ? (
+        <div style={{ padding: 16, background: C.okBg, borderRadius: 10 }}>No hay alertas registradas todavía para este parcial.</div>
+      ) : (
+        <div style={{ overflowX: 'auto' }}>
+          <table style={tableStyle}>
+            <thead><tr><th style={thStyle}>Matrícula</th><th style={thStyle}>Nombre</th><th style={thStyle}>Grupo</th><th style={thStyle}>Docente</th><th style={thStyle}>% Asistencia</th><th style={thStyle}>% Plataforma</th></tr></thead>
+            <tbody>{alertas.map((a) => (
+              <tr key={a.matricula}>
+                <td style={tdStyle}>{a.matricula}</td><td style={tdStyle}>{a.nombre}</td><td style={tdStyle}>{a.grupo}</td><td style={tdStyle}>{a.docente}</td>
+                <td style={tdStyle}>{a.pct === null ? '—' : <Badge ok={!a.bajaAsistencia}>{a.pct.toFixed(0)}%</Badge>}</td>
+                <td style={tdStyle}>{a.plataforma === null ? '—' : <Badge ok={!a.bajaPlataforma}>{a.plataforma}%</Badge>}</td>
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ReporteGeneralView({ grupos, meta }) {
+  const [generando, setGenerando] = useState(false);
+
+  async function generarReporteGeneral() {
+    setGenerando(true);
+    const filas = [];
+    for (const g of grupos) {
+      const asisResp = await apiGet({ action: 'asistencia', grupo: g.grupo });
+      const asistenciaGrupo = asisResp.asistencia || {};
+      const califResp = await apiGet({ action: 'calificaciones', grupo: g.grupo });
+      const califGrupo = califResp.calificaciones || {};
+      g.estudiantes.forEach((s) => {
+        const fila = { Matrícula: s.matricula, Nombre: s.nombre, División: s.division, Grupo: s.grupo, Nivel: s.nivel, Docente: s.docente, Diagnóstico: s.diagnostico ?? '' };
+        const notasDerecho = [];
+        for (let p = 0; p < meta.numPeriodos; p++) {
+          const reg = (califGrupo[s.matricula] && califGrupo[s.matricula][p]) || {};
+          const asis = pctAsistencia(asistenciaGrupo, s.matricula, p, meta);
+          const cumple = cumpleRequisitos(asis, reg);
+          const calif = calcularCalificacion(reg);
+          fila[`P${p + 1} % Asistencia`] = asis === null ? '' : Number(asis.toFixed(1));
+          fila[`P${p + 1} % Plataforma`] = reg.plataforma ?? '';
+          fila[`P${p + 1} Oral`] = reg.oral ?? '';
+          fila[`P${p + 1} Use of English`] = reg.usoEnglish ?? '';
+          fila[`P${p + 1} Cumple`] = cumple ? 'Sí' : 'No';
+          fila[`P${p + 1} Calificación`] = calif === null ? '' : Number(calif.toFixed(2));
+          if (cumple && calif !== null) notasDerecho.push(calif);
+        }
+        fila['Promedio general'] = notasDerecho.length ? Number((notasDerecho.reduce((a, b) => a + b, 0) / notasDerecho.length).toFixed(2)) : '';
+        filas.push(fila);
+      });
+    }
+    descargarWorkbook([{ nombre: 'Reporte general', filas }], 'Reporte_General_CELEX.xlsx');
+    setGenerando(false);
+  }
+
+  return (
+    <div>
+      <h3>Reporte general exportable</h3>
+      <p style={{ color: C.textMuted, fontSize: 13, maxWidth: 560 }}>
+        Genera un Excel con todos los estudiantes, todos los grupos: diagnóstico, % de asistencia, % de plataforma, Oral, Use of English, si cumple requisitos, calificación por parcial y promedio general. Puede tardar porque recorre los {grupos.length} grupos.
+      </p>
+      <Btn onClick={generarReporteGeneral} disabled={generando}>{generando ? 'Generando…' : '⬇ Descargar reporte general (.xlsx)'}</Btn>
+    </div>
+  );
+}
+
+function ConfigView({ meta, guardarMeta, coordToken }) {
+  const [local, setLocal] = useState(meta);
+  const [pinActual, setPinActual] = useState('');
+  const [pinNuevo, setPinNuevo] = useState('');
+  const [pinNuevoConfirm, setPinNuevoConfirm] = useState('');
+  const [pinMsg, setPinMsg] = useState('');
+
+  useEffect(() => { setLocal(meta); }, [meta]);
+
+  async function cambiarPin() {
+    if (pinNuevo.length < 4) { setPinMsg('Usa al menos 4 caracteres.'); return; }
+    if (pinNuevo !== pinNuevoConfirm) { setPinMsg('Los dos PIN no coinciden.'); return; }
+    const r = await apiPost({ action: 'cambiarPin', pinActual, pinNuevo });
+    if (r.error) { setPinMsg(r.error); return; }
+    setPinMsg('PIN actualizado. La próxima vez que entres, usa el nuevo.');
+    setPinActual(''); setPinNuevo(''); setPinNuevoConfirm('');
+  }
+
+  return (
+    <div style={{ maxWidth: 560 }}>
+      <h3>Configuración del semestre</h3>
+      <label style={labelStyle}>Fecha de inicio del semestre</label>
+      <input type="date" value={local.startDate} onChange={(e) => setLocal({ ...local, startDate: e.target.value })} style={inputStyle} />
+      <label style={labelStyle}>Número de parciales</label>
+      <input type="number" min={1} max={10} value={local.numPeriodos} onChange={(e) => setLocal({ ...local, numPeriodos: Number(e.target.value) })} style={inputStyle} />
+      <label style={labelStyle}>Semanas por parcial</label>
+      <input type="number" min={1} max={10} value={local.weeksPerPeriodo} onChange={(e) => setLocal({ ...local, weeksPerPeriodo: Number(e.target.value) })} style={inputStyle} />
+      <div style={{ marginTop: 16 }}><Btn onClick={() => guardarMeta(local)}>Guardar configuración</Btn></div>
+      <div style={{ fontSize: 12, color: C.textMuted, marginTop: 14, lineHeight: 1.5 }}>
+        Reglas fijas: la calificación parcial se compone de <strong>60% Oral</strong> + <strong>40% Use of English</strong>. Un estudiante tiene derecho a calificación solo si alcanza <strong>85% de asistencia</strong> y <strong>70% de plataforma</strong> en ese parcial. El promedio general solo usa los parciales donde tuvo derecho.
+      </div>
+
+      <hr style={{ margin: '28px 0', border: 'none', borderTop: `1px solid ${C.border}` }} />
+
+      <h3 style={{ marginBottom: 6 }}>Acceso de Coordinación</h3>
+      <label style={labelStyle}>PIN actual</label>
+      <input type="password" value={pinActual} onChange={(e) => setPinActual(e.target.value)} style={inputStyle} />
+      <label style={labelStyle}>Nuevo PIN</label>
+      <input type="password" value={pinNuevo} onChange={(e) => setPinNuevo(e.target.value)} style={inputStyle} />
+      <label style={labelStyle}>Confirma el nuevo PIN</label>
+      <input type="password" value={pinNuevoConfirm} onChange={(e) => setPinNuevoConfirm(e.target.value)} style={inputStyle} />
+      {pinMsg && <div style={{ fontSize: 13, marginTop: 8, color: pinMsg.startsWith('PIN actualizado') ? C.teal2 : C.danger }}>{pinMsg}</div>}
+      <div style={{ marginTop: 12 }}><Btn variant="ghost" onClick={cambiarPin}>Actualizar PIN</Btn></div>
+      <div style={{ fontSize: 12, color: C.textMuted, marginTop: 10, lineHeight: 1.5 }}>
+        Este PIN se valida en el servidor (Google Apps Script), no en el navegador — es una mejora real de seguridad frente a una validación puramente local.
+      </div>
+    </div>
+  );
+}
+
+function GrupoDetalle({ grupo, meta, periodoActualIdx, volver }) {
+  const [tab, setTab] = useState('asistencia');
+  const [fecha, setFecha] = useState(todayStr());
+  const [asistenciaGrupo, setAsistenciaGrupo] = useState(null);
+  const [registroDia, setRegistroDia] = useState({});
+  const [califGrupo, setCalifGrupo] = useState(null);
+  const [periodoSel, setPeriodoSel] = useState(periodoActualIdx);
+  const [guardando, setGuardando] = useState(false);
+
+  useEffect(() => { cargarAsistencia(); cargarCalif(); }, [grupo.grupo]);
+  useEffect(() => { if (asistenciaGrupo) setRegistroDia(asistenciaGrupo[fecha] ? { ...asistenciaGrupo[fecha] } : {}); }, [fecha, asistenciaGrupo]);
+
+  async function cargarAsistencia() {
+    const r = await apiGet({ action: 'asistencia', grupo: grupo.grupo });
+    setAsistenciaGrupo(r.asistencia || {});
+  }
+  async function cargarCalif() {
+    const r = await apiGet({ action: 'calificaciones', grupo: grupo.grupo });
+    setCalifGrupo(r.calificaciones || {});
+  }
+
+  function marcar(matricula, estado) { setRegistroDia((prev) => ({ ...prev, [matricula]: estado })); }
+  function marcarTodos(estado) {
+    const nuevo = {}; grupo.estudiantes.forEach((s) => { nuevo[s.matricula] = estado; }); setRegistroDia(nuevo);
+  }
+
+  async function guardarAsistencia() {
+    setGuardando(true);
+    const r = await apiPost({ action: 'guardarAsistencia', grupo: grupo.grupo, fecha, registros: registroDia });
+    if (!r.error) setAsistenciaGrupo((prev) => ({ ...prev, [fecha]: registroDia }));
+    setGuardando(false);
+  }
+
+  function pctPeriodoActualEstudiante(matricula) { return pctAsistencia(asistenciaGrupo, matricula, periodoActualIdx, meta); }
+
+  function actualizarCalif(matricula, campo, valor) {
+    setCalifGrupo((prev) => {
+      const nuevo = { ...prev };
+      if (!nuevo[matricula]) nuevo[matricula] = {};
+      if (!nuevo[matricula][periodoSel]) nuevo[matricula][periodoSel] = {};
+      nuevo[matricula][periodoSel] = { ...nuevo[matricula][periodoSel], [campo]: valor };
+      return nuevo;
+    });
+  }
+
+  async function guardarCalif() {
+    setGuardando(true);
+    const registros = {};
+    grupo.estudiantes.forEach((s) => {
+      const reg = (califGrupo[s.matricula] && califGrupo[s.matricula][periodoSel]) || null;
+      if (reg) registros[s.matricula] = reg;
+    });
+    await apiPost({ action: 'guardarCalificaciones', grupo: grupo.grupo, periodo: periodoSel, registros });
+    setGuardando(false);
+  }
+
+  function promedioGeneral(matricula) {
+    if (!califGrupo || !califGrupo[matricula]) return null;
+    const notas = [];
+    for (let p = 0; p < meta.numPeriodos; p++) {
+      const reg = califGrupo[matricula][p];
+      if (!reg) continue;
+      const asis = pctAsistencia(asistenciaGrupo, matricula, p, meta);
+      const cumple = cumpleRequisitos(asis, reg);
+      const calif = calcularCalificacion(reg);
+      if (cumple && calif !== null) notas.push(calif);
+    }
+    if (notas.length === 0) return null;
+    return notas.reduce((a, b) => a + b, 0) / notas.length;
+  }
+
+  function exportarReporteGrupo() {
+    const filas = grupo.estudiantes.map((s) => {
+      const fila = { Matrícula: s.matricula, Nombre: s.nombre, Nivel: s.nivel, Diagnóstico: s.diagnostico ?? '' };
+      for (let p = 0; p < meta.numPeriodos; p++) {
+        const reg = (califGrupo[s.matricula] && califGrupo[s.matricula][p]) || {};
+        const asis = pctAsistencia(asistenciaGrupo, s.matricula, p, meta);
+        const cumple = cumpleRequisitos(asis, reg);
+        const calif = calcularCalificacion(reg);
+        fila[`Parcial ${p + 1} - % Asistencia`] = asis === null ? '' : Number(asis.toFixed(1));
+        fila[`Parcial ${p + 1} - % Plataforma`] = reg.plataforma ?? '';
+        fila[`Parcial ${p + 1} - Oral`] = reg.oral ?? '';
+        fila[`Parcial ${p + 1} - Use of English`] = reg.usoEnglish ?? '';
+        fila[`Parcial ${p + 1} - Cumple requisitos`] = cumple ? 'Sí' : 'No';
+        fila[`Parcial ${p + 1} - Calificación`] = calif === null ? '' : Number(calif.toFixed(2));
+      }
+      const prom = promedioGeneral(s.matricula);
+      fila['Promedio general'] = prom === null ? '' : Number(prom.toFixed(2));
+      return fila;
+    });
+    descargarWorkbook([{ nombre: grupo.grupo, filas }], `Reporte_${grupo.grupo}.xlsx`);
+  }
+
+  if (asistenciaGrupo === null || califGrupo === null) return <div style={{ color: C.textMuted }}>Cargando grupo…</div>;
+
+  return (
+    <div>
+      <Btn variant="ghost" small onClick={volver}>← Volver</Btn>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, margin: '14px 0 4px' }}>
+        <h2 style={{ margin: 0 }}>{grupo.grupo}</h2>
+        <span style={{ color: C.textMuted }}>Nivel {grupo.nivel} · {grupo.horario}{grupo.aula ? ` · Aula ${grupo.aula}` : ''}</span>
+      </div>
+      <div style={{ color: C.textMuted, marginBottom: 16, fontSize: 14 }}>
+        Docente: <strong style={{ color: C.text }}>{grupo.docente || 'Sin asignar'}</strong> · {grupo.estudiantes.length} estudiantes
+      </div>
+
+      <Tabs tabs={[{ key: 'asistencia', label: 'Asistencia' }, { key: 'calificaciones', label: 'Calificaciones' }]} active={tab} onChange={setTab} />
+
+      {tab === 'asistencia' && (
+        <div>
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginBottom: 14, flexWrap: 'wrap' }}>
+            <input type="date" value={fecha} onChange={(e) => setFecha(e.target.value)} style={{ ...inputStyle, maxWidth: 170 }} />
+            <span style={{ fontSize: 13, color: C.textMuted }}>Parcial {periodoDeFecha(fecha, meta) + 1} de {meta.numPeriodos}</span>
+            <div style={{ marginLeft: 'auto' }}><Btn small variant="ghost" onClick={() => marcarTodos('P')}>Marcar todos presentes</Btn></div>
+          </div>
+          <div style={{ overflowX: 'auto' }}>
+            <table style={tableStyle}>
+              <thead><tr><th style={thStyle}>#</th><th style={thStyle}>Matrícula</th><th style={thStyle}>Nombre</th><th style={thStyle}>Estado</th><th style={thStyle}>% Asistencia (parcial actual)</th></tr></thead>
+              <tbody>
+                {grupo.estudiantes.map((s, i) => {
+                  const pct = pctPeriodoActualEstudiante(s.matricula);
+                  return (
+                    <tr key={s.matricula}>
+                      <td style={tdStyle}>{i + 1}</td>
+                      <td style={tdStyle}>{s.matricula}</td>
+                      <td style={tdStyle}>{s.nombre}</td>
+                      <td style={tdStyle}>
+                        <div style={{ display: 'flex', gap: 4 }}>
+                          {ESTADOS.map((e) => (
+                            <button key={e} onClick={() => marcar(s.matricula, e)} style={{ border: `1px solid ${ESTADO_COLOR[e]}`, background: registroDia[s.matricula] === e ? ESTADO_COLOR[e] : 'transparent', color: registroDia[s.matricula] === e ? '#fff' : ESTADO_COLOR[e], borderRadius: 8, padding: '4px 10px', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}>{e}</button>
+                          ))}
+                        </div>
+                      </td>
+                      <td style={tdStyle}>{pct === null ? '—' : <Badge ok={pct >= 85}>{pct.toFixed(0)}%</Badge>}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <div style={{ marginTop: 14 }}><Btn onClick={guardarAsistencia} disabled={guardando}>{guardando ? 'Guardando…' : `Guardar asistencia del ${fecha}`}</Btn></div>
+        </div>
+      )}
+
+      {tab === 'calificaciones' && (
+        <div>
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginBottom: 14, flexWrap: 'wrap' }}>
+            <label style={{ fontSize: 13, fontWeight: 700, color: C.textMuted }}>Parcial:</label>
+            <select value={periodoSel} onChange={(e) => setPeriodoSel(Number(e.target.value))} style={{ ...inputStyle, maxWidth: 160 }}>
+              {Array.from({ length: meta.numPeriodos }).map((_, i) => <option key={i} value={i}>Parcial {i + 1}</option>)}
+            </select>
+            <div style={{ marginLeft: 'auto' }}><Btn variant="teal" small onClick={exportarReporteGrupo}>⬇ Exportar reporte del grupo (.xlsx)</Btn></div>
+          </div>
+          <div style={{ overflowX: 'auto' }}>
+            <table style={tableStyle}>
+              <thead><tr>
+                <th style={thStyle}>Matrícula</th><th style={thStyle}>Nombre</th><th style={thStyle}>Diagnóstico</th><th style={thStyle}>% Asistencia</th>
+                <th style={thStyle}>% Plataforma</th><th style={thStyle}>Oral (60%)</th><th style={thStyle}>Use of English (40%)</th>
+                <th style={thStyle}>Cumple requisitos</th><th style={thStyle}>Calificación parcial</th><th style={thStyle}>Promedio general</th>
+              </tr></thead>
+              <tbody>
+                {grupo.estudiantes.map((s) => {
+                  const asis = pctAsistencia(asistenciaGrupo, s.matricula, periodoSel, meta);
+                  const reg = (califGrupo[s.matricula] && califGrupo[s.matricula][periodoSel]) || {};
+                  const cumple = cumpleRequisitos(asis, reg);
+                  const calif = calcularCalificacion(reg);
+                  const prom = promedioGeneral(s.matricula);
+                  return (
+                    <tr key={s.matricula}>
+                      <td style={tdStyle}>{s.matricula}</td>
+                      <td style={tdStyle}>{s.nombre}</td>
+                      <td style={tdStyle}>{s.diagnostico ?? '—'}</td>
+                      <td style={tdStyle}>{asis === null ? '—' : <Badge ok={asis >= 85}>{asis.toFixed(0)}%</Badge>}</td>
+                      <td style={tdStyle}><input type="number" min={0} max={100} value={reg.plataforma ?? ''} onChange={(e) => actualizarCalif(s.matricula, 'plataforma', e.target.value)} style={{ ...inputStyle, width: 70, padding: '4px 8px' }} /></td>
+                      <td style={tdStyle}><input type="number" min={0} max={10} step={0.1} value={reg.oral ?? ''} onChange={(e) => actualizarCalif(s.matricula, 'oral', e.target.value)} style={{ ...inputStyle, width: 70, padding: '4px 8px' }} /></td>
+                      <td style={tdStyle}><input type="number" min={0} max={10} step={0.1} value={reg.usoEnglish ?? ''} onChange={(e) => actualizarCalif(s.matricula, 'usoEnglish', e.target.value)} style={{ ...inputStyle, width: 70, padding: '4px 8px' }} /></td>
+                      <td style={tdStyle}><Badge ok={cumple}>{cumple ? 'Sí' : 'No'}</Badge></td>
+                      <td style={tdStyle}>{!cumple || calif === null ? '—' : calif.toFixed(2)}</td>
+                      <td style={tdStyle}>{prom === null ? '—' : prom.toFixed(1)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <div style={{ marginTop: 14 }}><Btn onClick={guardarCalif} disabled={guardando}>{guardando ? 'Guardando…' : 'Guardar calificaciones'}</Btn></div>
+          <div style={{ fontSize: 12, color: C.textMuted, marginTop: 10, lineHeight: 1.5 }}>
+            La calificación parcial se compone de <strong>60% Oral</strong> + <strong>40% Use of English</strong>. Solo tiene derecho si asistencia ≥85% y plataforma ≥70% (candado independiente). El promedio general solo usa parciales con derecho.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App />);
+</script>
+</body>
+</html>
